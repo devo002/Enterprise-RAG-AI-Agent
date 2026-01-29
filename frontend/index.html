@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Enterprise RAG Assistant</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; background: #f6f6f6; }
+    .container { max-width: 900px; margin: 0 auto; padding: 20px; }
+    .header { background: #111; color: #fff; padding: 16px 20px; border-radius: 10px; }
+    .chat { margin-top: 14px; background: #fff; border-radius: 10px; padding: 14px; height: 70vh; overflow-y: auto; }
+    .msg {
+      margin: 10px 0;
+      padding: 10px 12px;
+      border-radius: 10px;
+      max-width: 85%;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+    .user { background: #e8f0fe; margin-left: auto; }
+    .assistant { background: #f1f3f4; margin-right: auto; }
+    .composer { display: flex; gap: 10px; margin-top: 12px; }
+    input[type="text"] { flex: 1; padding: 12px; border-radius: 10px; border: 1px solid #ddd; }
+    button { padding: 12px 16px; border: none; border-radius: 10px; background: #111; color: #fff; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .hint { color: #555; font-size: 12px; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h2 style="margin:0;">Enterprise Real-Time RAG Assistant</h2>
+      <div style="opacity:0.9; font-size:14px;">Streaming answers from your policy knowledge base</div>
+    </div>
+
+    <div id="chat" class="chat"></div>
+
+    <div class="composer">
+      <input id="input" type="text" placeholder="Ask about refunds, remote work, tax, holidays..." />
+      <button id="sendBtn">Send</button>
+    </div>
+
+    <div class="hint">
+      Backend must be running: <code>uvicorn backend.app:app --reload</code>
+    </div>
+  </div>
+
+  <script>
+    const chatEl = document.getElementById("chat");
+    const inputEl = document.getElementById("input");
+    const sendBtn = document.getElementById("sendBtn");
+
+    const API_URL = "http://127.0.0.1:8000/chat/stream";
+
+    function getSessionId() {
+        let sid = localStorage.getItem("session_id");
+        if (!sid) {
+            sid = (crypto.randomUUID && crypto.randomUUID()) || ("sid_" + Math.random().toString(16).slice(2));
+            localStorage.setItem("session_id", sid);
+        }
+        return sid;
+    }
+
+const SESSION_ID = getSessionId();
+
+
+    function addMessage(role, text) {
+      const div = document.createElement("div");
+      div.className = "msg " + (role === "user" ? "user" : "assistant");
+      div.textContent = text;
+      chatEl.appendChild(div);
+      chatEl.scrollTop = chatEl.scrollHeight;
+      return div;
+    }
+
+    async function sendMessage() {
+      const message = inputEl.value.trim();
+      if (!message) return;
+
+      inputEl.value = "";
+      sendBtn.disabled = true;
+      inputEl.disabled = true;
+
+      addMessage("user", message);
+
+      // Assistant bubble we stream into
+      const assistantBubble = addMessage("assistant", "");
+
+      try {
+        const res = await fetch(API_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: SESSION_ID, message })
+        });
+
+        if (!res.ok || !res.body) {
+          assistantBubble.textContent = `Error: ${res.status} ${res.statusText}`;
+          return;
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+
+        let buffer = "";
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+
+          // SSE messages separated by blank line
+          const events = buffer.split("\n\n");
+          buffer = events.pop(); // leftover partial
+
+          for (const event of events) {
+            // An SSE "event" can have multiple lines; process data lines
+            const lines = event.split("\n");
+
+            for (const rawLine of lines) {
+              if (!rawLine.startsWith("data:")) continue;
+
+              const data = rawLine.slice(5); // DO NOT trim (keeps spaces)
+
+              // Done marker
+              if (data.trim() === "[DONE]") {
+                const fullText = assistantBubble.textContent;
+                const splitBySources = fullText.split("Sources:");
+
+                if (splitBySources.length > 1) {
+                  // Main answer
+                  assistantBubble.textContent = splitBySources[0].trim();
+
+                  // Sources section
+                  const sourcesDiv = document.createElement("div");
+                  sourcesDiv.style.marginTop = "8px";
+                  sourcesDiv.style.fontSize = "12px";
+                  sourcesDiv.style.color = "#555";
+                  sourcesDiv.style.borderTop = "1px solid #ddd";
+                  sourcesDiv.style.paddingTop = "6px";
+                  sourcesDiv.textContent = "Sources:" + splitBySources[1];
+
+                  assistantBubble.appendChild(sourcesDiv);
+                }
+
+                sendBtn.disabled = false;
+                inputEl.disabled = false;
+                inputEl.focus();
+                return;
+              }
+
+              // Error marker
+              if (data.trim().startsWith("[ERROR]")) {
+                assistantBubble.textContent += data.replace(/\\n/g, "\n");
+                sendBtn.disabled = false;
+                inputEl.disabled = false;
+                return;
+              }
+
+              // Normal token stream
+              assistantBubble.textContent += data.replace(/\\n/g, "\n");
+              chatEl.scrollTop = chatEl.scrollHeight;
+            }
+          }
+        }
+
+      } catch (err) {
+        assistantBubble.textContent = "Error: " + err.message;
+      } finally {
+        sendBtn.disabled = false;
+        inputEl.disabled = false;
+        inputEl.focus();
+      }
+    }
+
+    sendBtn.addEventListener("click", sendMessage);
+    inputEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") sendMessage();
+    });
+
+    addMessage("assistant", "Hi! Ask me anything about refunds, remote work, tax rules, or holidays based on company knowledge.");
+  </script>
+</body>
+</html>
