@@ -1,0 +1,17 @@
+name: Redeploy backend when Knowledge Base changes
+
+on:
+  push:
+    paths:
+      - "knowledge_base/**"
+      - "backend/ingest.py"
+      - "requirements.txt"
+  workflow_dispatch: {}
+
+jobs:
+  redeploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render deploy hook
+        run: |
+          curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
