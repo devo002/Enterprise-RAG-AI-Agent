@@ -2,7 +2,7 @@ import re
 
 DEPARTMENT_KEYWORDS = {
     "finance": [
-        "refund", "invoice", "payment", "reimbursement", "expense", "tax", "salary", "payroll", "billing"
+        "refund", "invoice", "payment", "reimbursement", "expense", "tax", "salary", "payroll", "billing", "reimburse", "reimbursement", "reimbursable", "expense", "expenses", "travel", "trip", "meals", "hotel", "flight"
     ],
     "hr": [
         "remote", "holiday", "leave", "vacation", "benefits", "policy", "work from home", "wfh", "sick", "hr"
