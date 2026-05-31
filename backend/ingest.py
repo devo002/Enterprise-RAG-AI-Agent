@@ -1,13 +1,15 @@
 import os
 import glob
+import shutil
 from pathlib import Path
 from collections import defaultdict
 
 from dotenv import load_dotenv
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
-from langchain_community.vectorstores import Chroma
-from langchain_openai import OpenAIEmbeddings
+import chromadb
+from llama_index.core import Document, VectorStoreIndex, StorageContext, Settings
+from llama_index.core.node_parser import SentenceSplitter
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.vector_stores.chroma import ChromaVectorStore
 
 
 def load_department_docs(kb_dir: str) -> dict[str, list[Document]]:
@@ -29,8 +31,6 @@ def load_department_docs(kb_dir: str) -> dict[str, list[Document]]:
 
     for f in files:
         path = Path(f)
-        # department is the immediate folder under knowledge_base
-        # e.g. knowledge_base/hr/remote_work_policy.md -> dept = "hr"
         try:
             dept = path.relative_to(kb_path).parts[0].lower()
         except Exception:
@@ -39,7 +39,7 @@ def load_department_docs(kb_dir: str) -> dict[str, list[Document]]:
         text = path.read_text(encoding="utf-8", errors="ignore")
         dept_docs[dept].append(
             Document(
-                page_content=text,
+                text=text,
                 metadata={
                     "source": str(path.as_posix()),
                     "department": dept,
@@ -61,30 +61,32 @@ def main():
 
     reset = os.getenv("RESET_CHROMA", "false").lower() == "true"
     if reset and Path(PERSIST_DIR).exists():
-        import shutil
         shutil.rmtree(PERSIST_DIR, ignore_errors=True)
+
+    Settings.embed_model = OpenAIEmbedding()
+
+    splitter = SentenceSplitter(chunk_size=1000, chunk_overlap=150)
 
     print(f"[1/4] Loading knowledge base from: {Path(KB_DIR).resolve()}")
     dept_docs = load_department_docs(KB_DIR)
     print(f"      Departments found: {list(dept_docs.keys())}")
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-    embeddings = OpenAIEmbeddings()
+    chroma_client = chromadb.PersistentClient(path=PERSIST_DIR)
 
     print("[2/4] Splitting + indexing per department...")
     for dept, docs in dept_docs.items():
-        chunks = splitter.split_documents(docs)
         collection_name = f"kb_{dept}"
+        chroma_collection = chroma_client.get_or_create_collection(collection_name)
+        vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+        storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-        print(f"   - Dept: {dept} | files={len(docs)} | chunks={len(chunks)} | collection={collection_name}")
-
-        vectordb = Chroma.from_documents(
-            documents=chunks,
-            embedding=embeddings,
-            persist_directory=PERSIST_DIR,
-            collection_name=collection_name,
+        index = VectorStoreIndex.from_documents(
+            docs,
+            storage_context=storage_context,
+            transformations=[splitter],
         )
-        vectordb.persist()
+        node_count = len(index.docstore.docs)
+        print(f"   - Dept: {dept} | files={len(docs)} | chunks={node_count} | collection={collection_name}")
 
     print(f"[3/4] Done ✅ Saved collections into: {Path(PERSIST_DIR).resolve()}")
     print("[4/4] Next: update backend router to choose department per question.")

@@ -7,9 +7,12 @@ from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.vectorstores import Chroma
+import chromadb
+from llama_index.core import VectorStoreIndex, StorageContext, Settings
+from llama_index.core.llms import ChatMessage, MessageRole
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.llms.openai import OpenAI
+from llama_index.vector_stores.chroma import ChromaVectorStore
 
 from backend.router import route_department
 
@@ -34,22 +37,25 @@ Sources:
 Only list sources that directly support the answer.
 """
 
+Settings.embed_model = OpenAIEmbedding()
 
-def load_vectordb_for_department(dept: str) -> Chroma:
+
+def load_index_for_department(dept: str) -> VectorStoreIndex:
     persist_dir = os.getenv("CHROMA_DIR", "chroma_db")
-    collection_name = f"kb_{dept}"  # must match your ingest.py collections: kb_hr, kb_finance, kb_it, kb_general
+    collection_name = f"kb_{dept}"
 
-    embeddings = OpenAIEmbeddings()
-    return Chroma(
-        persist_directory=persist_dir,
-        embedding_function=embeddings,
-        collection_name=collection_name,
-    )
+    chroma_client = chromadb.PersistentClient(path=persist_dir)
+    chroma_collection = chroma_client.get_or_create_collection(collection_name)
+    vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+
+    return VectorStoreIndex.from_vector_store(vector_store, storage_context=storage_context)
 
 
-def retrieve_context(vectordb: Chroma, query: str, k: int = 5) -> List[Dict[str, Any]]:
-    docs = vectordb.similarity_search(query, k=k)
-    return [{"source": d.metadata.get("source", "unknown_source"), "text": d.page_content} for d in docs]
+def retrieve_context(index: VectorStoreIndex, query: str, k: int = 5) -> List[Dict[str, Any]]:
+    retriever = index.as_retriever(similarity_top_k=k)
+    nodes = retriever.retrieve(query)
+    return [{"source": n.metadata.get("source", "unknown_source"), "text": n.text} for n in nodes]
 
 
 def format_context(chunks: List[Dict[str, Any]]) -> str:
@@ -65,13 +71,12 @@ app = FastAPI(title="Enterprise Real-Time RAG Assistant")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # local dev only
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Memory (last N messages per session)
 MAX_TURNS = 8
 CHAT_STORE = defaultdict(lambda: deque(maxlen=MAX_TURNS))
 
@@ -80,25 +85,19 @@ def format_history(session_id: str) -> str:
     turns = CHAT_STORE[session_id]
     if not turns:
         return ""
-
     lines = []
     for t in turns:
-        if t["role"] == "user":
-            lines.append(f"User: {t['content']}")
-        else:
-            lines.append(f"Assistant: {t['content']}")
+        prefix = "User" if t["role"] == "user" else "Assistant"
+        lines.append(f"{prefix}: {t['content']}")
     return "\n".join(lines)
 
 
-# Load department vector DBs once
 DEPARTMENTS = ["hr", "finance", "it", "general"]
-VDBS = {d: load_vectordb_for_department(d) for d in DEPARTMENTS}
+INDEXES = {d: load_index_for_department(d) for d in DEPARTMENTS}
 
-# LLM once
-LLM = ChatOpenAI(
+LLM = OpenAI(
     model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
     temperature=0,
-    streaming=True,
 )
 
 
@@ -125,15 +124,11 @@ def chat_reset(req: ResetRequest):
 
 @app.post("/chat/stream")
 def chat_stream(req: ChatRequest):
-    # 1) route to department
     dept = route_department(req.message)
-    vectordb = VDBS.get(dept, VDBS["general"])
+    index = INDEXES.get(dept, INDEXES["general"])
 
-    # 2) retrieve context from that department KB
-    chunks = retrieve_context(vectordb, req.message, k=req.k)
+    chunks = retrieve_context(index, req.message, k=req.k)
     context_text = format_context(chunks)
-
-    # 3) include memory
     history_text = format_history(req.session_id)
 
     user_prompt = f"""Department selected: {dept.upper()}
@@ -158,21 +153,20 @@ Sources:
 (only sources that support the answer)
 """
 
+    messages = [
+        ChatMessage(role=MessageRole.SYSTEM, content=SYSTEM_PROMPT),
+        ChatMessage(role=MessageRole.USER, content=user_prompt),
+    ]
+
     async def event_generator():
         full_answer = ""
         try:
-            async for chunk in LLM.astream(
-                [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ]
-            ):
-                token = chunk.content or ""
+            async for chunk in await LLM.astream_chat(messages):
+                token = chunk.delta or ""
                 if token:
                     full_answer += token
                     yield f"data: {token}\n\n"
 
-            # Save to memory after completion
             CHAT_STORE[req.session_id].append({"role": "user", "content": req.message})
             CHAT_STORE[req.session_id].append({"role": "assistant", "content": full_answer})
 

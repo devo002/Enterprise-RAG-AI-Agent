@@ -35,17 +35,17 @@ pip install -r requirements.txt
 Get your OPENAI_API_KEY create a .env file and save the key 
 
 
-### 4 Start FastAPI
-```bash
-uvicorn backend.app:app --reload
-```
-
-### 5 Run the ingestion to create the chromadb
+### 4 Run the ingestion to create the chromadb
 ```bash
 python backend/ingest.py
 ```
 
-### 5 Open the web interface
+### 5 Start FastAPI
+```bash
+uvicorn backend.app:app --reload
+```
+
+### 6 Open the web interface
 Go to the frontend folder and open the index.html with liveserver and start the chat about anything.
 
 
@@ -54,7 +54,7 @@ Go to the frontend folder and open the index.html with liveserver and start the 
 ### Create the Render service
 Go to Render and connect to the github project. Select python as the runtime
 
-Set Build command
+Set Build commandpip install -r requirements.txt
 ```bash
 pip install -r requirements.txt && python backend/ingest.py
 ```

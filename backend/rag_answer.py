@@ -3,9 +3,12 @@ from pathlib import Path
 from typing import List, Dict, Any
 
 from dotenv import load_dotenv
-
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.vectorstores import Chroma
+import chromadb
+from llama_index.core import VectorStoreIndex, StorageContext, Settings
+from llama_index.core.llms import ChatMessage, MessageRole
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.llms.openai import OpenAI
+from llama_index.vector_stores.chroma import ChromaVectorStore
 
 
 SYSTEM_PROMPT = """You are an enterprise knowledge assistant.
@@ -27,8 +30,7 @@ Only list sources that directly support the answer.
 """
 
 
-
-def load_vectordb(persist_dir: str, collection_name: str) -> Chroma:
+def load_index(persist_dir: str, collection_name: str) -> VectorStoreIndex:
     persist_path = Path(persist_dir)
     if not persist_path.exists():
         raise FileNotFoundError(
@@ -36,29 +38,22 @@ def load_vectordb(persist_dir: str, collection_name: str) -> Chroma:
             f"Run ingestion first: python backend/ingest.py"
         )
 
-    embeddings = OpenAIEmbeddings()
-    return Chroma(
-        persist_directory=persist_dir,
-        embedding_function=embeddings,
-        collection_name=collection_name,
-    )
+    Settings.embed_model = OpenAIEmbedding()
+    chroma_client = chromadb.PersistentClient(path=persist_dir)
+    chroma_collection = chroma_client.get_or_create_collection(collection_name)
+    vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+
+    return VectorStoreIndex.from_vector_store(vector_store, storage_context=storage_context)
 
 
-def retrieve_context(vectordb: Chroma, query: str, k: int = 5) -> List[Dict[str, Any]]:
-    docs = vectordb.similarity_search(query, k=k)
-    results = []
-    for d in docs:
-        results.append(
-            {
-                "source": d.metadata.get("source", "unknown_source"),
-                "text": d.page_content,
-            }
-        )
-    return results
+def retrieve_context(index: VectorStoreIndex, query: str, k: int = 5) -> List[Dict[str, Any]]:
+    retriever = index.as_retriever(similarity_top_k=k)
+    nodes = retriever.retrieve(query)
+    return [{"source": n.metadata.get("source", "unknown_source"), "text": n.text} for n in nodes]
 
 
 def format_context(chunks: List[Dict[str, Any]]) -> str:
-    # Create a readable context block with sources
     parts = []
     for i, c in enumerate(chunks, start=1):
         parts.append(f"[{i}] Source: {c['source']}\n{c['text']}")
@@ -69,12 +64,11 @@ def answer_question(question: str, k: int = 5) -> str:
     persist_dir = os.getenv("CHROMA_DIR", "chroma_db")
     collection_name = os.getenv("CHROMA_COLLECTION", "enterprise_kb")
 
-    vectordb = load_vectordb(persist_dir, collection_name)
-    chunks = retrieve_context(vectordb, question, k=k)
-
+    index = load_index(persist_dir, collection_name)
+    chunks = retrieve_context(index, question, k=k)
     context_text = format_context(chunks)
 
-    llm = ChatOpenAI(
+    llm = OpenAI(
         model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
         temperature=0,
     )
@@ -96,14 +90,13 @@ Sources:
 (using only sources that appeared in the context)
 """
 
-    resp = llm.invoke(
-        [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ]
-    )
+    messages = [
+        ChatMessage(role=MessageRole.SYSTEM, content=SYSTEM_PROMPT),
+        ChatMessage(role=MessageRole.USER, content=user_prompt),
+    ]
 
-    return resp.content
+    resp = llm.chat(messages)
+    return resp.message.content
 
 
 def main():
